@@ -1,0 +1,85 @@
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import layers, models
+from tensorflow.keras.datasets import mnist
+from tensorflow.keras import backend as K
+
+# Load MNIST data
+(x_train, _), (x_test, _) = mnist.load_data()
+
+# Normalize the pixel values to be between 0 and 1
+x_train = x_train.astype('float32') / 255.0
+x_test = x_test.astype('float32') / 255.0
+
+# Reshape the images to (28, 28, 1)
+x_train = np.reshape(x_train, (len(x_train), 28, 28, 1))
+x_test = np.reshape(x_test, (len(x_test), 28, 28, 1))
+
+# VAE model for anomaly detection
+latent_dim = 2  # Set the latent dimension (you can experiment with different values)
+input_shape = (28, 28, 1)
+
+def sampling(args):
+    z_mean, z_log_var = args
+    batch = K.shape(z_mean)[0]
+    dim = K.int_shape(z_mean)[1]
+    epsilon = K.random_normal(shape=(batch, dim))
+    return z_mean + K.exp(0.5 * z_log_var) * epsilon
+
+# Encoder
+encoder_inputs = tf.keras.Input(shape=input_shape)
+x = layers.Conv2D(32, 3, activation='relu', strides=2, padding='same')(encoder_inputs)
+x = layers.Conv2D(64, 3, activation='relu', strides=2, padding='same')(x)
+x = layers.Flatten()(x)
+z_mean = layers.Dense(latent_dim, name='z_mean')(x)
+z_log_var = layers.Dense(latent_dim, name='z_log_var')(x)
+
+z = layers.Lambda(sampling, output_shape=(latent_dim,), name='z')([z_mean, z_log_var])
+
+encoder = models.Model(encoder_inputs, [z_mean, z_log_var, z], name='encoder')
+
+# Decoder
+latent_inputs = tf.keras.Input(shape=(latent_dim,))
+x = layers.Dense(7 * 7 * 64, activation='relu')(latent_inputs)
+x = layers.Reshape((7, 7, 64))(x)
+x = layers.Conv2DTranspose(64, 3, activation='relu', strides=2, padding='same')(x)
+x = layers.Conv2DTranspose(32, 3, activation='relu', strides=2, padding='same')(x)
+decoder_outputs = layers.Conv2DTranspose(1, 3, activation='sigmoid', padding='same')(x)
+
+decoder = models.Model(latent_inputs, decoder_outputs, name='decoder')
+
+# VAE
+vae_outputs = decoder(encoder(encoder_inputs)[2])
+vae = models.Model(encoder_inputs, vae_outputs, name='vae')
+
+# Loss function for VAE
+xent_loss = tf.keras.losses.mean_squared_error(K.flatten(encoder_inputs), K.flatten(vae_outputs))
+xent_loss *= input_shape[0] * input_shape[1]
+kl_loss = 1 + z_log_var - K.square(z_mean) - K.exp(z_log_var)
+kl_loss = K.sum(kl_loss, axis=-1)
+kl_loss *= -0.5
+vae_loss = K.mean(xent_loss + kl_loss)
+
+vae.add_loss(vae_loss)
+vae.compile(optimizer='adam')
+
+# Training the VAE
+vae.fit(x_train, x_train, epochs=10, batch_size=128, validation_data=(x_test, x_test))
+
+# Reconstruction loss on the test set
+reconstructed_images = vae.predict(x_test)
+reconstruction_loss = np.mean(np.square(reconstructed_images - x_test))
+
+# Define a threshold for anomaly detection
+threshold = reconstruction_loss + 2.5 * np.std(reconstruction_loss)
+
+# Detect anomalies in the training set
+train_reconstructed_images = vae.predict(x_train)
+train_reconstruction_loss = np.mean(np.square(train_reconstructed_images - x_train))
+anomalies_train = train_reconstruction_loss > threshold
+
+# Detect anomalies in the test set
+anomalies_test = reconstruction_loss > threshold
+
+print("Number of anomalies in training set:", np.sum(anomalies_train))
+print("Number of anomalies in test set:", np.sum(anomalies_test))
